@@ -802,19 +802,30 @@ void R2C<T,D,C>::setLocalDomain (std::array<int,AMREX_SPACEDIM> const& local_sta
                                  std::array<int,AMREX_SPACEDIM> const& local_size)
 {
     auto const& [ba, dm] = make_layout_from_local_domain(local_start, local_size);
-    m_raw_mf = MF(ba, dm, m_rx.nComp(), 0, MFInfo().SetAlloc(false));
+    m_raw_mf = MF(ba, dm, m_info.batch_size, 0, MFInfo().SetAlloc(false));
 }
 
 template <typename T, Direction D, bool C>
 std::pair<std::array<int,AMREX_SPACEDIM>,std::array<int,AMREX_SPACEDIM>>
 R2C<T,D,C>::getLocalDomain () const
 {
-    m_raw_mf = MF(m_rx.boxArray(), m_rx.DistributionMap(), m_rx.nComp(), 0,
-                  MFInfo{}.SetAlloc(false));
+    auto const ncomp = m_info.batch_size;
+
+#if (AMREX_SPACEDIM > 1)
+    if (m_r2c_sub) {
+        m_raw_mf = MF(m_sub_helper.inverse_boxarray(m_r2c_sub->m_rx.boxArray()),
+                      m_r2c_sub->m_rx.DistributionMap(), ncomp, 0,
+                      MFInfo{}.SetAlloc(false));
+    } else
+#endif
+    {
+        m_raw_mf = MF(m_rx.boxArray(), m_rx.DistributionMap(), ncomp, 0,
+                      MFInfo{}.SetAlloc(false));
+    }
 
     auto const myproc = ParallelContext::MyProcSub();
-    if (myproc < m_rx.size()) {
-        Box const& box = m_rx.box(myproc);
+    if (myproc < m_raw_mf.size()) {
+        Box const& box = m_raw_mf.box(myproc);
         return std::make_pair(box.smallEnd().toArray(),
                               box.length().toArray());
     } else {
@@ -828,7 +839,7 @@ void R2C<T,D,C>::setLocalSpectralDomain (std::array<int,AMREX_SPACEDIM> const& l
                                          std::array<int,AMREX_SPACEDIM> const& local_size)
 {
     auto const& [ba, dm] = make_layout_from_local_domain(local_start, local_size);
-    m_raw_cmf = cMF(ba, dm, m_rx.nComp(), 0, MFInfo().SetAlloc(false));
+    m_raw_cmf = cMF(ba, dm, m_info.batch_size, 0, MFInfo().SetAlloc(false));
 }
 
 template <typename T, Direction D, bool C>
@@ -1226,24 +1237,44 @@ R2C<T,D,C>::make_c2c_plans (cMF& inout, int ndims) const
 
 namespace fft_detail {
     // The trailing int/long parameter orders these two overloads. A call
+<<<<<<< HEAD
     // passing a literal 0 prefers the GpuComplex<T>& version, and falls back
     // to the CellData version only when the former is not viable. Without it,
     // a functor taking a generic parameter by value or by const reference
     // would make the two overloads ambiguous.
+=======
+    // passing a literal 0 prefers the GpuComplex<T>& version, which is
+    // called once per component of the batch, and falls back to the CellData
+    // version only when the former is not viable. Without it, a functor
+    // taking a generic parameter by value or by const reference would make
+    // the two overloads ambiguous.
+>>>>>>> development
     template <typename F, typename T>
     AMREX_GPU_DEVICE AMREX_FORCE_INLINE
     auto call_post_forward (F const& f, int i, int j, int k, Array4<T> const& a,
                             int ii, int jj, int kk, int)
+<<<<<<< HEAD
         noexcept -> decltype(f(0,0,0,a(0,0,0)))
     {
         f(i,j,k,a(ii,jj,kk));
+=======
+        noexcept -> decltype(void(f(0,0,0,a(0,0,0))))
+    {
+        for (int n = 0; n < a.nComp(); ++n) {
+            f(i,j,k,a(ii,jj,kk,n));
+        }
+>>>>>>> development
     }
 
     template <typename F, typename T>
     AMREX_GPU_DEVICE AMREX_FORCE_INLINE
     auto call_post_forward (F const& f, int i, int j, int k, Array4<T> const& a,
                             int ii, int jj, int kk, long)
+<<<<<<< HEAD
         noexcept -> decltype(f(0,0,0,a.cellData(0,0,0)))
+=======
+        noexcept -> decltype(void(f(0,0,0,a.cellData(0,0,0))))
+>>>>>>> development
     {
         f(i,j,k,a.cellData(ii,jj,kk));
     }
@@ -1262,7 +1293,11 @@ void R2C<T,D,C>::post_forward_doit_0 (F const& post_forward)
         // The original domain is (1,ny). The sub domain is (ny,1).
         m_r2c_sub->post_forward_doit_1
             ([=] AMREX_GPU_DEVICE (int i, int, int, auto&& sp)
+<<<<<<< HEAD
                   -> decltype(post_forward(0,0,0,static_cast<decltype(sp)>(sp)))
+=======
+                  -> decltype(void(post_forward(0,0,0,static_cast<decltype(sp)>(sp))))
+>>>>>>> development
              {
                  post_forward(0, i, 0, static_cast<decltype(sp)>(sp));
              });
@@ -1271,7 +1306,11 @@ void R2C<T,D,C>::post_forward_doit_0 (F const& post_forward)
             // Original domain: (1, 1, nz). Sub domain: (nz, 1, 1)
             m_r2c_sub->post_forward_doit_1
                 ([=] AMREX_GPU_DEVICE (int i, int, int, auto&& sp)
+<<<<<<< HEAD
                       -> decltype(post_forward(0,0,0,static_cast<decltype(sp)>(sp)))
+=======
+                      -> decltype(void(post_forward(0,0,0,static_cast<decltype(sp)>(sp))))
+>>>>>>> development
                  {
                      post_forward(0, 0, i, static_cast<decltype(sp)>(sp));
                  });
@@ -1279,7 +1318,11 @@ void R2C<T,D,C>::post_forward_doit_0 (F const& post_forward)
             // Original domain: (1, ny, 1). Sub domain: (ny, 1, 1)
             m_r2c_sub->post_forward_doit_1
                 ([=] AMREX_GPU_DEVICE (int i, int, int, auto&& sp)
+<<<<<<< HEAD
                           -> decltype(post_forward(0,0,0,static_cast<decltype(sp)>(sp)))
+=======
+                          -> decltype(void(post_forward(0,0,0,static_cast<decltype(sp)>(sp))))
+>>>>>>> development
                      {
                          post_forward(0, i, 0, static_cast<decltype(sp)>(sp));
                      });
@@ -1287,7 +1330,11 @@ void R2C<T,D,C>::post_forward_doit_0 (F const& post_forward)
             // Original domain: (1, ny, nz). Sub domain: (ny, nz, 1)
             m_r2c_sub->post_forward_doit_1
                 ([=] AMREX_GPU_DEVICE (int i, int j, int, auto&& sp)
+<<<<<<< HEAD
                           -> decltype(post_forward(0,0,0,static_cast<decltype(sp)>(sp)))
+=======
+                          -> decltype(void(post_forward(0,0,0,static_cast<decltype(sp)>(sp))))
+>>>>>>> development
                      {
                          post_forward(0, i, j, static_cast<decltype(sp)>(sp));
                      });
@@ -1295,7 +1342,11 @@ void R2C<T,D,C>::post_forward_doit_0 (F const& post_forward)
             // Original domain: (nx, 1, nz). Sub domain: (nx, nz, 1)
             m_r2c_sub->post_forward_doit_1
                 ([=] AMREX_GPU_DEVICE (int i, int j, int, auto&& sp)
+<<<<<<< HEAD
                           -> decltype(post_forward(0,0,0,static_cast<decltype(sp)>(sp)))
+=======
+                          -> decltype(void(post_forward(0,0,0,static_cast<decltype(sp)>(sp))))
+>>>>>>> development
                      {
                          post_forward(i, 0, j, static_cast<decltype(sp)>(sp));
                      });
@@ -1358,8 +1409,14 @@ void R2C<T,D,C>::post_forward_doit_1 (F const& post_forward)
 template <typename T, Direction D, bool C>
 T R2C<T,D,C>::scalingFactor () const
 {
+#if (AMREX_SPACEDIM > 1)
+    // The sub-object knows which axes are actually transformed.
+    if (m_r2c_sub) { return m_r2c_sub->scalingFactor(); }
+#endif
+
 #if (AMREX_SPACEDIM == 3)
-    if (m_info.oned_mode && !m_info.twod_mode) {
+    // oned_mode wins over twod_mode, like it does when the plans are made.
+    if (m_info.oned_mode) {
         return T(1)/T(Long(m_real_domain.length(0)));
     } else if (m_info.twod_mode) {
         return T(1)/T(Long(m_real_domain.length(0)) *

@@ -126,7 +126,6 @@ are coupled, such as when projecting a vector field in spectral space.
 
 Note that a callable taking a :cpp:`GpuComplex<Real>&` sees only component 0
 of the batch.
-
 .. _sec:FFT:c2c:
 
 FFT::C2C Class

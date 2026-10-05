@@ -37,6 +37,7 @@ namespace amrex::EB2 {
 
 class IndexSpace;
 template <typename G> class GShopLevel;
+template <typename G> class IndexSpaceImp;
 
 class Level
 {
@@ -173,6 +174,20 @@ public:
         bool m_built = false;
     };
 
+    /**
+     * \brief Index type of the face-centered edge centroids for edge direction \p idim.
+     *
+     * The edge is cell-typed in the direction it runs along and nodal in the others, as in the
+     * cell-centered path, except that \p face_dir is always nodal: that is how a box spans the
+     * staggered cells it owns. Used for both the level's data and the factory's, which have to
+     * agree - fillEdgeCentFC copies one into the other.
+     */
+    [[nodiscard]] static IntVect fcEdgeType (int idim, int face_dir) noexcept {
+        IntVect edge_type{1};
+        if (idim != face_dir) { edge_type[idim] = 0; }
+        return edge_type;
+    }
+
     //! Check if face-centered data is available for face_dir (0=x, 1=y, 2=z).
     [[nodiscard]] bool hasFCData (int face_dir) const noexcept {
         return face_dir >= 0 && face_dir < AMREX_SPACEDIM &&
@@ -181,7 +196,7 @@ public:
 
     //! Get reference to face-centered data for face_dir (0=x, 1=y, 2=z).
     [[nodiscard]] const FCData& getFCData (int face_dir) const {
-        AMREX_ASSERT(hasFCData(face_dir));
+        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(hasFCData(face_dir), "EB2::Level: FC data not available for face_dir");
         return *m_fc_data[face_dir];
     }
 
@@ -222,6 +237,8 @@ public:
     int coarsenFromFine (Level& fineLevel, bool fill_boundary);
     //! Build EBCellFlag data from the current implicit function field.
     void buildCellFlag ();
+    //! Build the face-centered EBCellFlag connectivity for \p face_dir from its area fractions.
+    void buildCellFlagFC (int face_dir);
     //! Build the cut-cell mask by coarsening from \p fine_level.
     void buildCutCellMask (Level const& fine_level);
 
@@ -259,6 +276,8 @@ protected:
 
 private:
     template <typename G> friend class GShopLevel;
+    // So that it can update m_parent when a level changes owner.
+    template <typename G> friend class IndexSpaceImp;
 
     // Need this function to work around a gcc bug.
     void setRegularLevel () {
@@ -371,8 +390,8 @@ GShopLevel<G>::prepare_grids (G const& gshop, const Geometry& geom,
     BoxList cut_boxes;
     BoxList covered_boxes;
 
-    const int nprocs = ParallelDescriptor::NProcs();
-    const int iproc = ParallelDescriptor::MyProc();
+    const int nprocs = ParallelContext::NProcsSub();
+    const int iproc = ParallelContext::MyProcSub();
 
     num_crse_opt = std::max(0,std::min(8,num_crse_opt));
     for (int clev = num_crse_opt; clev >= 0; --clev) {
@@ -849,15 +868,37 @@ GShopLevel<G>::buildFCData (G const& gshop, int face_dir, int max_grid_size)
 
     // Always create transient refined CC level to avoid grid mismatch
     // with application-defined BoxArrays (ERF EB-FC development)
+    // An even max_grid_size keeps the refined grids coarsenable by 2.
     Geometry refined_geom = amrex::refine(m_geom, 2);
     transient_level = std::make_unique<GShopLevel<G>>(
         m_parent, gshop, refined_geom,
-        max_grid_size, m_ngrow[0] > 0 ? m_ngrow[0] : 4, true, 0); // xxxxx TODO: should we use IndexSpace's member variables extend_domain_face and num_crse_opt?
+        std::max(2, max_grid_size - max_grid_size%2), m_ngrow[0] > 0 ? m_ngrow[0] : 4, true, 0); // xxxxx TODO: should we use IndexSpace's member variables extend_domain_face and num_crse_opt?
 
     if (!transient_level->isOK()) {
         amrex::Abort("GShopLevel::buildFCData: failed to build refined level");
     }
     refined_cc_level = transient_level.get();
+
+    // Leave the data unbuilt; a face-centered factory on this level would then fail.
+    auto skip = [&] (char const* why) {
+        if (amrex::Verbose() > 0) {
+            amrex::Print() << "AMReX EB: no face-centered data for face_dir " << face_dir
+                           << " on domain " << m_geom.Domain() << ": " << why << '\n';
+        }
+        m_fc_data[face_dir].reset();
+    };
+
+    // Coarse levels can have features too thin for their 2x rebuild to see.
+    if (refined_cc_level->isAllRegular()) {
+        skip("refined level has no cut cells");
+        return;
+    }
+
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+        refined_cc_level->m_grids.coarsenable(2) &&
+        (refined_cc_level->m_covered_grids.empty() ||
+         refined_cc_level->m_covered_grids.coarsenable(2)),
+        "GShopLevel::buildFCData: refined grids are not coarsenable");
 
     // **********************************************************************
     // STEP2: Check multi-cut error
@@ -875,7 +916,7 @@ GShopLevel<G>::buildFCData (G const& gshop, int face_dir, int max_grid_size)
     const BoxArray fc_base_grids = amrex::coarsen(refined_cc_level->m_grids, 2);
     if (!refined_cc_level->m_covered_grids.empty()) {
         m_fc_data[face_dir]->m_covered_grids_fc =
-            amrex::coarsen(refined_cc_level->m_covered_grids, 2);
+            amrex::coarsen(refined_cc_level->m_covered_grids, 2).simplified();
     }
     const DistributionMapping fc_dmap = refined_cc_level->m_dmap;
 
@@ -938,7 +979,7 @@ GShopLevel<G>::buildFCData (G const& gshop, int face_dir, int max_grid_size)
 
     {
         bool b = mvmc_error;
-        ParallelDescriptor::ReduceBoolOr(b);
+        ParallelAllReduce::Or(b, ParallelContext::CommunicatorSub());
         mvmc_error = b;
     }
     if (mvmc_error) {
@@ -960,20 +1001,31 @@ GShopLevel<G>::buildFCData (G const& gshop, int face_dir, int max_grid_size)
     auto& fc_facecent = m_fc_data[face_dir]->m_facecent_fc;
     auto& fc_edgecent = m_fc_data[face_dir]->m_edgecent_fc;
 
-    // Index types of the face-centered data:
+    // Index types of the face-centered data. One rule covers all of it: face_dir is nodal,
+    // because that is how a box spans staggered cells - there is one more of them than there
+    // are cell-centered cells, and nodal is how AMReX says so. The remaining directions carry
+    // whatever type the cell-centered path would give.
     //
-    //   cellflag / volfrac / centroid / bndry*   nodal in face_dir, i.e. (N,C,C) for face_dir=0,
-    //                                            (C,N,C) for 1, (C,C,N) for 2. These are the
-    //                                            staggered cells themselves.
-    //   areafrac[idim] / facecent[idim]          the cell-centered base grids, the same for
-    //                                            every idim.
-    //   edgecent[idim]                           set by which two directions the edge spans.
+    //   cellflag / volfrac / centroid / bndry*   nodal in face_dir alone, i.e. (N,C,C) for
+    //                                            face_dir=0, (C,N,C) for 1, (C,C,N) for 2.
+    //                                            These are the staggered cells themselves.
+    //   areafrac[idim] / facecent[idim]          the same, for every idim.
+    //   edgecent[idim]                           cell in idim and nodal elsewhere, as in the
+    //                                            cell-centered path, with face_dir forced nodal.
     //
-    // areafrac and facecent are kept uniform on purpose. The cell-centered path gives each
-    // direction its own nodal index type (areafrac[0] is (N,C,C), areafrac[1] is (C,N,C), ...);
-    // carrying that over to a grid already staggered in face_dir would put three different index
-    // types in play at once for no real gain. Here all three are simply indexed by the staggered
-    // cell they belong to.
+    // areafrac and facecent are kept uniform across idim on purpose. The cell-centered path
+    // gives each direction its own nodal index type (areafrac[0] is (N,C,C), areafrac[1] is
+    // (C,N,C), ...); carrying that over to a grid already staggered in face_dir would put three
+    // different index types in play at once for no real gain. Here all three are simply indexed
+    // by the staggered cell they belong to, and areafrac[idim](i,j,k) is that cell's low face in
+    // direction idim, with areafrac[idim](i+1,j,k) its high one.
+    //
+    // Indexing by the staggered cell is why face_dir has to be nodal even here. The valid box
+    // then holds every staggered cell the box owns, which is what coarsen_from_fine below fills
+    // and what the fill*FC ParallelCopy can hand out. A cell-typed face_dir would stop one short
+    // and leave the last staggered cell of every box in the ghost region, where the copy cannot
+    // reach it: the covered-region mask in fill*FC would clear that plane with nothing able to
+    // write it back.
 
     // Define FC MultiFabs
     BoxArray fc_grids = amrex::convert(fc_base_grids, IntVect::TheDimensionVector(face_dir));
@@ -986,14 +1038,10 @@ GShopLevel<G>::buildFCData (G const& gshop, int face_dir, int max_grid_size)
     fc_bndrynorm.define(fc_grids, fc_dmap, AMREX_SPACEDIM, ng);
 
     for (int idim = 0; idim < AMREX_SPACEDIM; ++idim) {
-        fc_areafrac[idim].define(fc_base_grids, fc_dmap, 1, ng);
-        fc_facecent[idim].define(fc_base_grids, fc_dmap, AMREX_SPACEDIM-1, ng);
-        IntVect edge_type{1};
-        if (idim != face_dir) {
-            edge_type[face_dir] = 0;
-            edge_type[idim] = 0;
-        }
-        fc_edgecent[idim].define(amrex::convert(fc_base_grids, edge_type), fc_dmap, 1, ng);
+        fc_areafrac[idim].define(fc_grids, fc_dmap, 1, ng);
+        fc_facecent[idim].define(fc_grids, fc_dmap, AMREX_SPACEDIM-1, ng);
+        fc_edgecent[idim].define(amrex::convert(fc_base_grids, Level::fcEdgeType(idim,face_dir)),
+                                 fc_dmap, 1, ng);
     }
 
     // **********************************************************************
@@ -1149,18 +1197,18 @@ GShopLevel<G>::buildFCData (G const& gshop, int face_dir, int max_grid_size)
 
     {
         bool b = error;
-        ParallelDescriptor::ReduceBoolOr(b);
+        ParallelAllReduce::Or(b, ParallelContext::CommunicatorSub());
         error = b;
     }
 
-    if (!error) {
-        buildCellFlag();
+    if (error) {
+        skip("coarsening failed");
+        return;
     }
 
-    // return error;
-
     m_fc_data[face_dir]->m_built = true;
-    // If transient_level exists, it's automatically destroyed here
+
+    buildCellFlagFC(face_dir);
 }
 
 }
