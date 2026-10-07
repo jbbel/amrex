@@ -59,22 +59,27 @@ int main (int argc, char* argv[])
         }
         auto const& dx = geom.CellSizeArray();
 
-        MultiFab vel(ba,dm,2,1);
+        MultiFab vel(ba,dm,AMREX_SPACEDIM,1);
         auto const& u = vel.arrays();
         ParallelFor(vel, [=] AMREX_GPU_DEVICE (int b, int i, int j, int k)
         {
+            constexpr Real tpi = Real(2.)*Math::pi<Real>();
             AMREX_D_TERM(Real x = (i+0.5_rt) * dx[0] - 0.5_rt;,
                          Real y = (j+0.5_rt) * dx[1] - 0.5_rt;,
                          Real z = (k+0.5_rt) * dx[2] - 0.5_rt);
-            u[b](i,j,k,0) = std::cos(Real(2.)*Math::pi<Real>()*x)
-                         + std::cos(Real(2.)*Math::pi<Real>()*y);
-            u[b](i,j,k,1) = std::cos(Real(2.)*Math::pi<Real>()*x+.2)
-                         + std::cos(Real(2.)*Math::pi<Real>()*y+.7);
+#if (AMREX_SPACEDIM == 2)
+            u[b](i,j,k,0) = std::cos(tpi*x) + std::cos(tpi*y);
+            u[b](i,j,k,1) = std::cos(tpi*x+.2) + std::cos(tpi*y+.7);
+#else
+            u[b](i,j,k,0) = std::cos(tpi*x) + std::cos(tpi*y) + std::cos(tpi*z+.3);
+            u[b](i,j,k,1) = std::cos(tpi*x+.2) + std::cos(tpi*y+.7) + std::sin(tpi*z);
+            u[b](i,j,k,2) = std::sin(tpi*x+.4) + std::cos(tpi*y+.1) + std::cos(tpi*z+.5);
+#endif
         });
 
         vel.FillBoundary(geom.periodicity());
 
-        MultiFab vel_return(ba,dm,2,1);
+        MultiFab vel_return(ba,dm,AMREX_SPACEDIM,1);
 
         {
             FFT::CrossProj crossproj(geom, fft_bc);
@@ -84,24 +89,41 @@ int main (int argc, char* argv[])
 
             MultiFab div_orig(ba, dm, 1, 0);
             MultiFab div_err(ba, dm, 1, 0);
-            auto const& u = vel.arrays();
             auto const& ud = vel_return.arrays();
             auto const& divinit = div_orig.arrays();
             auto const& div = div_err.arrays();
+
+            // Node-centered cross-stencil divergence at (i+1/2,j+1/2,k+1/2)
+            auto nodediv = [=] AMREX_GPU_DEVICE (Array4<Real const> const& v,
+                                                 int i, int j, int k) -> Real
+            {
+#if (AMREX_SPACEDIM == 2)
+                return (v(i+1,j+1,k,0) + v(i+1,j,k,0) - v(i,j+1,k,0) - v(i,j,k,0))
+                    * (0.5_rt/dx[0])
+                    +  (v(i+1,j+1,k,1) + v(i,j+1,k,1) - v(i+1,j,k,1) - v(i,j,k,1))
+                    * (0.5_rt/dx[1]);
+#else
+                Real dvx = 0, dvy = 0, dvz = 0;
+                for (int s = 0; s <= 1; ++s) {
+                for (int t = 0; t <= 1; ++t) {
+                    dvx += v(i+1,j+s,k+t,0) - v(i,j+s,k+t,0);
+                    dvy += v(i+s,j+1,k+t,1) - v(i+s,j,k+t,1);
+                    dvz += v(i+s,j+t,k+1,2) - v(i+s,j+t,k,2);
+                }}
+                return dvx*(0.25_rt/dx[0]) + dvy*(0.25_rt/dx[1]) + dvz*(0.25_rt/dx[2]);
+#endif
+            };
+
             ParallelFor(div_err, [=] AMREX_GPU_DEVICE (int b, int i, int j, int k)
             {
-             
-                divinit[b](i,j,k) = u[b](i+1,j+1,k,0) + u[b](i+1,j,k,0) - u[b](i,j+1,k,0)  - u[b](i,j,k,0) 
-                               +     u[b](i+1,j+1,k,1) + u[b](i,j+1,k,1) - u[b](i+1,j,k,1)  - u[b](i,j,k,1) ;
-                div[b](i,j,k) = ud[b](i+1,j+1,k,0) + ud[b](i+1,j,k,0) - ud[b](i,j+1,k,0)  - ud[b](i,j,k,0) 
-                               +     ud[b](i+1,j+1,k,1) + ud[b](i,j+1,k,1) - ud[b](i+1,j,k,1)  - ud[b](i,j,k,1) ;
-             });
-
+                divinit[b](i,j,k) = nodediv(u[b], i, j, k);
+                div[b](i,j,k) = nodediv(ud[b], i, j, k);
+            });
 
             Real div_initial = div_orig.norminf();
             Real div_error = div_err.norminf();
             amrex::Print() << "  original divergence " << div_initial << "\n";
-            amrex::Print() << "  divegence expected to be close to zero: " << div_error << "\n";
+            amrex::Print() << "  divergence expected to be close to zero: " << div_error << "\n";
         }
     }
     amrex::Finalize();

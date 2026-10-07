@@ -24,12 +24,18 @@ void fill_physbc (MF& mf, Geometry const& geom,
 
 /**
  * \ingroup amrex_fft
- * \brief CrossProj solver for periodic, Dirichlet & Neumann boundaries using
- * FFT.
+ * \brief FFT-based projection of a cell-centered velocity field onto the
+ * space of fields that are divergence free with respect to the node-centered
+ * cross-stencil divergence.
+ *
+ * The divergence at each node is computed from the 4 (2D) or 8 (3D) cells
+ * surrounding it. Currently only all-periodic boundaries are supported, in
+ * 2D and 3D. The velocity MF must have AMREX_SPACEDIM components.
  */
 template <typename MF = MultiFab>
 class CrossProj
 {
+    static_assert(AMREX_SPACEDIM >= 2, "FFT::CrossProj requires AMREX_SPACEDIM >= 2");
 public:
 
     /**
@@ -53,7 +59,7 @@ public:
         }
         if (all_periodic) {
             Info info = Info{};
-            info.setBatchSize(2);
+            info.setBatchSize(AMREX_SPACEDIM);
             m_r2c = std::make_unique<R2C<typename MF::value_type>>(m_geom.Domain(), info);
         } else {
             m_r2x = std::make_unique<R2X<typename MF::value_type>> (m_geom.Domain(), m_bc);
@@ -75,8 +81,8 @@ public:
     {
         if (m_geom.isAllPeriodic()) {
             Info info = Info{};
-            info.setBatchSize(2);
-            m_r2c = std::make_unique<R2C<typename MF::value_type>>(m_geom.Domain());
+            info.setBatchSize(AMREX_SPACEDIM);
+            m_r2c = std::make_unique<R2C<typename MF::value_type>>(m_geom.Domain(), info);
         } else {
             amrex::Abort("FFT::CrossProj: wrong BC");
         }
@@ -107,6 +113,9 @@ void CrossProj<MF>::solve (MF& a_soln, MF const& a_rhs)
 {
     BL_PROFILE("FFT::CrossProj::solve");
 
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(m_r2c != nullptr,
+        "FFT::CrossProj: only all-periodic boundaries are currently supported");
+
     MF* soln = &a_soln;
     MF const* rhs = &a_rhs;
     MF solntmp, rhstmp;
@@ -124,11 +133,6 @@ void CrossProj<MF>::solve (MF& a_soln, MF const& a_rhs)
         {AMREX_D_DECL(Math::pi<T>()/(T(m_geom.Domain().length(0))),
                       Math::pi<T>()/(T(m_geom.Domain().length(1))),
                       Math::pi<T>()/(T(m_geom.Domain().length(2))))};
-    for (int idim = 0; idim < AMREX_SPACEDIM; ++idim) {
-        if (m_bc[idim].first == Boundary::periodic) {
-            fac[idim] *= T(1);
-        }
-    }
     GpuArray<T,AMREX_SPACEDIM> dxfac
         {AMREX_D_DECL(T(1)/T(m_geom.CellSize(0)),
                       T(1)/T(m_geom.CellSize(1)),
@@ -163,19 +167,41 @@ void CrossProj<MF>::solve (MF& a_soln, MF const& a_rhs)
                      T b = fac[1]*(j+offset[1]);,
                      T c = fac[2]*(k+offset[2]));
 
-        T cdiffx = (std::sin(a+b)+std::sin(a-b))*dxfac[0];
-        T cdiffy = (std::sin(a+b)-std::sin(a-b))*dxfac[1];
+        // Fourier symbol of the node-centered cross-stencil divergence, up
+        // to a common factor that cancels in the projection.  The half
+        // angles a, b, c make the symbol only change sign (as a whole
+        // vector) for the unshifted high wavenumbers stored by R2C.
+#if (AMREX_SPACEDIM == 2)
+        T sx = std::sin(a)*std::cos(b)*dxfac[0];
+        T sy = std::cos(a)*std::sin(b)*dxfac[1];
 
-        auto cdiv = cdiffx * spectral_data[0] +cdiffy * spectral_data[1];;
+        auto cdiv = sx * spectral_data[0] + sy * spectral_data[1];
 
-        T dginv = cdiffx*cdiffx + cdiffy*cdiffy;
+        T dginv = sx*sx + sy*sy;
         if (std::abs(dginv) > T(1.e-10)) {
-            cdiv /= dginv;;
+            cdiv /= dginv;
         }
-        spectral_data[0] -=  cdiffx * cdiv;
-        spectral_data[1] -=  cdiffy * cdiv;
-        spectral_data[0] *= scale;
-        spectral_data[1] *= scale;
+        spectral_data[0] -= sx * cdiv;
+        spectral_data[1] -= sy * cdiv;
+#else
+        T sx = std::sin(a)*std::cos(b)*std::cos(c)*dxfac[0];
+        T sy = std::cos(a)*std::sin(b)*std::cos(c)*dxfac[1];
+        T sz = std::cos(a)*std::cos(b)*std::sin(c)*dxfac[2];
+
+        auto cdiv = sx * spectral_data[0] + sy * spectral_data[1]
+            +       sz * spectral_data[2];
+
+        T dginv = sx*sx + sy*sy + sz*sz;
+        if (std::abs(dginv) > T(1.e-10)) {
+            cdiv /= dginv;
+        }
+        spectral_data[0] -= sx * cdiv;
+        spectral_data[1] -= sy * cdiv;
+        spectral_data[2] -= sz * cdiv;
+#endif
+        for (int n = 0; n < AMREX_SPACEDIM; ++n) {
+            spectral_data[n] *= scale;
+        }
     };
 
     IntVect const& ng = amrex::elemwiseMin(soln->nGrowVect(), IntVect(1));
